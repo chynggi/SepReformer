@@ -171,6 +171,86 @@ class Engine(object):
                 src = torch.squeeze(estim_src[i][...,:mixture.shape[-1]]).cpu().data.numpy()
                 sf.write(sample[:-4]+'_out_'+str(i)+'.wav', 0.9*src/max(abs(src)), self.fs)
 
+    @logger_wraps()
+    def _inference_folder(self, folder_path):
+        """
+        Process all wav files in the specified folder
+        Model is loaded once and used for all files
+        """
+        if folder_path is None:
+            raise ValueError("Folder path must be provided for infer_folder mode")
+        
+        if not os.path.exists(folder_path):
+            raise ValueError(f"Folder path does not exist: {folder_path}")
+        
+        # Get all wav files in the folder
+        wav_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.wav')]
+        
+        if len(wav_files) == 0:
+            logger.warning(f"No wav files found in {folder_path}")
+            return
+        
+        logger.info(f"Found {len(wav_files)} wav files to process in {folder_path}")
+        
+        # Set output directory
+        if self.out_wav_dir is None:
+            out_dir = folder_path
+        else:
+            out_dir = self.out_wav_dir
+            os.makedirs(out_dir, exist_ok=True)
+        
+        logger.info(f"Output directory: {out_dir}")
+        
+        # Set model to eval mode once
+        self.model.eval()
+        self.fs = self.config["dataset"]["sampling_rate"]
+        self.stride = self.config["model"]["module_audio_enc"]["stride"]
+        
+        # Process all files with inference mode
+        with torch.inference_mode():
+            pbar = tqdm(wav_files, unit='files', bar_format='{l_bar}{bar:25}{r_bar}{bar:-10b}', 
+                       colour="GREEN", dynamic_ncols=True, desc="Processing audio files")
+            
+            for wav_file in pbar:
+                sample_path = os.path.join(folder_path, wav_file)
+                pbar.set_postfix_str(f"Processing: {wav_file}")
+                
+                try:
+                    # Load audio
+                    mixture, _ = librosa.load(sample_path, sr=self.fs)
+                    mixture = torch.tensor(mixture, dtype=torch.float32)[None]
+                    
+                    # Apply padding if necessary
+                    remains = mixture.shape[-1] % self.stride
+                    if remains != 0:
+                        padding = self.stride - remains
+                        mixture_padded = torch.nn.functional.pad(mixture, (0, padding), "constant", 0)
+                    else:
+                        mixture_padded = mixture
+                    
+                    # Inference
+                    nnet_input = mixture_padded.to(self.device)
+                    estim_src, _ = torch.nn.parallel.data_parallel(self.model, nnet_input, device_ids=self.gpuid)
+                    
+                    # Save results
+                    mixture_np = torch.squeeze(mixture).cpu().numpy()
+                    base_name = os.path.splitext(wav_file)[0]
+                    output_path = os.path.join(out_dir, base_name + '_in.wav')
+                    sf.write(output_path, 0.9*mixture_np/max(abs(mixture_np)), self.fs)
+                    
+                    for i in range(self.config['model']['num_spks']):
+                        src = torch.squeeze(estim_src[i][...,:mixture.shape[-1]]).cpu().data.numpy()
+                        output_path = os.path.join(out_dir, base_name + f'_out_{i}.wav')
+                        sf.write(output_path, 0.9*src/max(abs(src)), self.fs)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {wav_file}: {str(e)}")
+                    continue
+            
+            pbar.close()
+        
+        logger.info(f"Successfully processed all files in {folder_path}")
+
     
     @logger_wraps()
     def run(self):
